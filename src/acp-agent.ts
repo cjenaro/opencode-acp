@@ -4,6 +4,8 @@ import {
   CancelNotification,
   InitializeRequest,
   InitializeResponse,
+  LoadSessionRequest,
+  LoadSessionResponse,
   ndJsonStream,
   NewSessionRequest,
   NewSessionResponse,
@@ -25,7 +27,6 @@ import { promptToOpencode } from "./converters.js";
 
 type Session = {
   id: string;
-  opencodeSessionId: string;
   cancelled: boolean;
   currentModel?: string;
 };
@@ -45,7 +46,6 @@ export class OpencodeAcpAgent {
     try {
       const baseUrl = process.env.OPENCODE_BASE_URL || "http://localhost:4096";
 
-      
       const opencode = await createOpencode({
         hostname: "127.0.0.1",
         port: 4096,
@@ -54,19 +54,15 @@ export class OpencodeAcpAgent {
 
       this.opencodeClient = opencode.client;
       this.opencodeServer = opencode.server;
-
-      
     } catch (error: any) {
       if (
         error.code === "EADDRINUSE" ||
         error.message?.includes("EADDRINUSE")
       ) {
-        
         const { createOpencodeClient } = await import("@opencode-ai/sdk");
         this.opencodeClient = createOpencodeClient({
           baseUrl: process.env.OPENCODE_BASE_URL || "http://localhost:4096",
         });
-        
       } else {
         console.error("[opencode-acp] Failed to connect to opencode:", error);
         throw error;
@@ -76,6 +72,7 @@ export class OpencodeAcpAgent {
     return {
       protocolVersion: 1,
       agentCapabilities: {
+        loadSession: true,
         promptCapabilities: {
           image: true,
           embeddedContext: true,
@@ -84,23 +81,30 @@ export class OpencodeAcpAgent {
           http: true,
           sse: true,
         },
+        _meta: {
+          "opencode.dev": {
+            sessionList: true,
+          },
+        },
       },
       authMethods: [],
     };
   }
 
-  async newSession(_params: NewSessionRequest): Promise<NewSessionResponse> {
+  async newSession(params: NewSessionRequest): Promise<NewSessionResponse> {
     if (!this.opencodeClient) {
       throw new Error("opencode client not initialized");
     }
 
-    const sessionId = crypto.randomUUID();
+    if (!params.cwd) {
+      throw new Error("cwd is required for session creation");
+    }
 
     try {
       const { data: opencodeSession, error } =
         await this.opencodeClient.session.create({
           body: {
-            title: `ACP Session ${new Date().toISOString()}`,
+            title: `ACP Session ${new Date().toISOString()} (${params.cwd})`,
           },
         });
 
@@ -108,20 +112,20 @@ export class OpencodeAcpAgent {
         throw new Error(`Failed to create opencode session: ${error}`);
       }
 
+      const sessionId = opencodeSession.id;
+
       this.sessions[sessionId] = {
         id: sessionId,
-        opencodeSessionId: opencodeSession.id,
         cancelled: false,
       };
 
-      
       const { data: providersData, error: providersError } =
         await this.opencodeClient.config.providers();
 
       if (providersError || !providersData?.providers) {
         console.error(
           `[opencode-acp] Error getting providers:`,
-          providersError
+          providersError,
         );
         return {
           sessionId,
@@ -138,13 +142,11 @@ export class OpencodeAcpAgent {
         };
       }
 
-      
-
       const availableModels = providersData.providers.flatMap(
         (provider: Provider) => {
           if (!provider.models || typeof provider.models !== "object") {
             console.error(
-              `[opencode-acp] Provider ${provider.id} has no models object`
+              `[opencode-acp] Provider ${provider.id} has no models object`,
             );
             return [];
           }
@@ -153,12 +155,11 @@ export class OpencodeAcpAgent {
             name: model.name || modelId,
             description: `${provider.name} - ${model.name || modelId}`,
           }));
-        }
+        },
       );
 
       const defaultModel = availableModels[0]?.modelId || "default";
       this.sessions[sessionId].currentModel = defaultModel;
-      
 
       return {
         sessionId,
@@ -184,7 +185,7 @@ export class OpencodeAcpAgent {
 
   async authenticate(_params: AuthenticateRequest): Promise<void> {
     throw new Error(
-      "Authentication not required - configure opencode separately"
+      "Authentication not required - configure opencode separately",
     );
   }
 
@@ -200,15 +201,12 @@ export class OpencodeAcpAgent {
     const session = this.sessions[params.sessionId];
     const parts = promptToOpencode(params);
 
-    
-
     try {
       const model = session.currentModel || "default";
       const [providerID, modelID] = model.split("/");
-      
 
       const { data: result, error } = await this.opencodeClient.session.prompt({
-        path: { id: session.opencodeSessionId },
+        path: { id: params.sessionId },
         body: {
           model: { providerID, modelID },
           parts,
@@ -223,8 +221,6 @@ export class OpencodeAcpAgent {
       if (!result) {
         throw new Error("No result from prompt");
       }
-
-      
 
       for (const part of result.parts) {
         if (part.type === "text") {
@@ -286,9 +282,8 @@ export class OpencodeAcpAgent {
     if (this.opencodeClient) {
       try {
         await this.opencodeClient.session.abort({
-          path: { id: session.opencodeSessionId },
+          path: { id: params.sessionId },
         });
-        
       } catch (error) {
         console.error("[opencode-acp] Failed to abort session:", error);
       }
@@ -296,15 +291,161 @@ export class OpencodeAcpAgent {
   }
 
   async setSessionModel(
-    params: SetSessionModelRequest
+    params: SetSessionModelRequest,
   ): Promise<SetSessionModelResponse | void> {
     if (!this.sessions[params.sessionId]) {
       throw new Error("Session not found");
     }
 
     const session = this.sessions[params.sessionId];
-    
     session.currentModel = params.modelId;
+  }
+
+  async loadSession(params: LoadSessionRequest): Promise<LoadSessionResponse> {
+    if (!this.opencodeClient) {
+      throw new Error("opencode client not initialized");
+    }
+
+    if (!params.cwd) {
+      throw new Error("cwd is required for session loading");
+    }
+
+    try {
+      const { data: opencodeSession, error } =
+        await this.opencodeClient.session.get({
+          path: { id: params.sessionId },
+        });
+
+      if (error || !opencodeSession) {
+        throw new Error(`Failed to load opencode session: ${error}`);
+      }
+
+      this.sessions[params.sessionId] = {
+        id: params.sessionId,
+        cancelled: false,
+      };
+
+      const { data: providersData, error: providersError } =
+        await this.opencodeClient.config.providers();
+
+      if (providersError || !providersData?.providers) {
+        console.error(
+          `[opencode-acp] Error getting providers:`,
+          providersError,
+        );
+        return {};
+      }
+
+      const availableModels = providersData.providers.flatMap(
+        (provider: Provider) => {
+          if (!provider.models || typeof provider.models !== "object") {
+            return [];
+          }
+          return Object.entries(provider.models).map(([modelId, model]) => ({
+            modelId: `${provider.id}/${modelId}`,
+            name: model.name || modelId,
+            description: `${provider.name} - ${model.name || modelId}`,
+          }));
+        },
+      );
+
+      const defaultModel = availableModels[0]?.modelId || "default";
+      this.sessions[params.sessionId].currentModel = defaultModel;
+
+      const { data: messagesData } = await this.opencodeClient.session.messages(
+        {
+          path: { id: params.sessionId },
+        },
+      );
+
+      if (messagesData) {
+        for (const message of messagesData) {
+          for (const part of message.parts) {
+            if (part.type === "text") {
+              const updateType =
+                message.info.role === "user"
+                  ? "user_message_chunk"
+                  : "agent_message_chunk";
+
+              await this.client.sessionUpdate({
+                sessionId: params.sessionId,
+                update: {
+                  sessionUpdate: updateType,
+                  content: {
+                    type: "text",
+                    text: part.text,
+                  },
+                },
+              });
+            } else if (
+              part.type === "reasoning" &&
+              message.info.role === "assistant"
+            ) {
+              await this.client.sessionUpdate({
+                sessionId: params.sessionId,
+                update: {
+                  sessionUpdate: "agent_thought_chunk",
+                  content: {
+                    type: "text",
+                    text: part.text,
+                  },
+                },
+              });
+            }
+          }
+        }
+      }
+
+      return {
+        models: {
+          availableModels:
+            availableModels.length > 0
+              ? availableModels
+              : [
+                  {
+                    modelId: "default",
+                    name: "Default Model",
+                    description: "opencode default model",
+                  },
+                ],
+          currentModelId: defaultModel,
+        },
+      };
+    } catch (error) {
+      console.error("[opencode-acp] Failed to load session:", error);
+      throw error;
+    }
+  }
+
+  async _session_list(): Promise<{ sessions: any[] }> {
+    if (!this.opencodeClient) {
+      throw new Error("opencode client not initialized");
+    }
+
+    try {
+      const { data: sessions, error } =
+        await this.opencodeClient.session.list();
+
+      if (error) {
+        throw new Error(`Failed to list sessions: ${error}`);
+      }
+
+      // Transform sessions to include metadata Zed might need
+      const transformedSessions = (sessions || []).map((session) => ({
+        id: session.id,
+        title: session.title || `Session ${session.id}`,
+        createdAt: session.time.created,
+        updatedAt: session.time.updated,
+        cwd: session.directory,
+      }));
+
+      return {
+        sessions: transformedSessions,
+      };
+    } catch (error) {
+      console.error("[opencode-acp] Failed to list sessions:", error);
+      throw error;
+    }
   }
 }
 
