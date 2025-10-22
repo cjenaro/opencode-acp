@@ -1,7 +1,10 @@
 import type { PromptRequest } from "@agentclientprotocol/sdk";
+import { type TextPartInput, type FilePartInput } from "@opencode-ai/sdk";
 
-export function promptToOpencode(prompt: PromptRequest) {
-  const parts = [];
+type OpencodePromptPart = TextPartInput | FilePartInput;
+
+export function promptToOpencode(prompt: PromptRequest): OpencodePromptPart[] {
+  const parts: OpencodePromptPart[] = [];
 
   for (const chunk of prompt.prompt) {
     switch (chunk.type) {
@@ -22,9 +25,9 @@ export function promptToOpencode(prompt: PromptRequest) {
       case "image":
         if (chunk.data) {
           parts.push({
-            type: "image",
-            data: chunk.data,
-            mimeType: chunk.mimeType,
+            type: "file",
+            mime: chunk.mimeType,
+            url: chunk.data,
           });
         }
         break;

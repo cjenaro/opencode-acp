@@ -1,5 +1,4 @@
 import {
-  Agent,
   AgentSideConnection,
   AuthenticateRequest,
   CancelNotification,
@@ -13,37 +12,22 @@ import {
   SetSessionModelRequest,
   SetSessionModelResponse,
 } from "@agentclientprotocol/sdk";
-import { createOpencode, OpencodeClient } from "@opencode-ai/sdk";
+import {
+  createOpencode,
+  OpencodeClient,
+  type Provider,
+  type TextPart,
+  type ToolPart,
+  type ReasoningPart,
+} from "@opencode-ai/sdk";
 import { nodeToWebReadable, nodeToWebWritable } from "./utils.js";
 import { promptToOpencode } from "./converters.js";
-
-interface OpencodeProvider {
-  id: string;
-  name: string;
-  models: Record<
-    string,
-    {
-      id?: string;
-      name?: string;
-    }
-  >;
-}
-
-interface OpencodeProvidersResponse {
-  data?: {
-    providers: OpencodeProvider[];
-  };
-  error?: string;
-}
-
-interface ExtendedPromptRequest extends PromptRequest {
-  model?: string;
-}
 
 type Session = {
   id: string;
   opencodeSessionId: string;
   cancelled: boolean;
+  currentModel?: string;
 };
 
 export class OpencodeAcpAgent {
@@ -57,13 +41,11 @@ export class OpencodeAcpAgent {
     this.client = client;
   }
 
-  async initialize(request: InitializeRequest): Promise<InitializeResponse> {
+  async initialize(_request: InitializeRequest): Promise<InitializeResponse> {
     try {
       const baseUrl = process.env.OPENCODE_BASE_URL || "http://localhost:4096";
 
-      console.error(
-        `[opencode-acp] Attempting to connect to existing opencode at ${baseUrl}...`
-      );
+      
       const opencode = await createOpencode({
         hostname: "127.0.0.1",
         port: 4096,
@@ -73,22 +55,18 @@ export class OpencodeAcpAgent {
       this.opencodeClient = opencode.client;
       this.opencodeServer = opencode.server;
 
-      console.error(
-        `[opencode-acp] Connected to opencode at ${opencode.server.url}`
-      );
+      
     } catch (error: any) {
       if (
         error.code === "EADDRINUSE" ||
         error.message?.includes("EADDRINUSE")
       ) {
-        console.error(
-          "[opencode-acp] Port already in use, connecting to existing server..."
-        );
+        
         const { createOpencodeClient } = await import("@opencode-ai/sdk");
         this.opencodeClient = createOpencodeClient({
           baseUrl: process.env.OPENCODE_BASE_URL || "http://localhost:4096",
         });
-        console.error("[opencode-acp] Connected to existing opencode server");
+        
       } else {
         console.error("[opencode-acp] Failed to connect to opencode:", error);
         throw error;
@@ -111,7 +89,7 @@ export class OpencodeAcpAgent {
     };
   }
 
-  async newSession(params: NewSessionRequest): Promise<NewSessionResponse> {
+  async newSession(_params: NewSessionRequest): Promise<NewSessionResponse> {
     if (!this.opencodeClient) {
       throw new Error("opencode client not initialized");
     }
@@ -136,11 +114,7 @@ export class OpencodeAcpAgent {
         cancelled: false,
       };
 
-      console.error(
-        `[opencode-acp] Created session ${sessionId} -> opencode ${opencodeSession.id}`
-      );
-
-      console.error(`[opencode-acp] Attempting to get providers list...`);
+      
       const { data: providersData, error: providersError } =
         await this.opencodeClient.config.providers();
 
@@ -164,13 +138,10 @@ export class OpencodeAcpAgent {
         };
       }
 
-      console.error(
-        `[opencode-acp] Available providers:`,
-        providersData.providers.map((p: OpencodeProvider) => p.id).join(", ")
-      );
+      
 
       const availableModels = providersData.providers.flatMap(
-        (provider: OpencodeProvider) => {
+        (provider: Provider) => {
           if (!provider.models || typeof provider.models !== "object") {
             console.error(
               `[opencode-acp] Provider ${provider.id} has no models object`
@@ -185,6 +156,10 @@ export class OpencodeAcpAgent {
         }
       );
 
+      const defaultModel = availableModels[0]?.modelId || "default";
+      this.sessions[sessionId].currentModel = defaultModel;
+      
+
       return {
         sessionId,
         models: {
@@ -198,7 +173,7 @@ export class OpencodeAcpAgent {
                     description: "opencode default model",
                   },
                 ],
-          currentModelId: availableModels[0]?.modelId || "default",
+          currentModelId: defaultModel,
         },
       };
     } catch (error) {
@@ -213,7 +188,7 @@ export class OpencodeAcpAgent {
     );
   }
 
-  async prompt(params: ExtendedPromptRequest): Promise<PromptResponse> {
+  async prompt(params: PromptRequest): Promise<PromptResponse> {
     if (!this.sessions[params.sessionId]) {
       throw new Error("Session not found");
     }
@@ -225,16 +200,12 @@ export class OpencodeAcpAgent {
     const session = this.sessions[params.sessionId];
     const parts = promptToOpencode(params);
 
-    console.error(
-      `[opencode-acp] Sending prompt to opencode session ${session.opencodeSessionId}`
-    );
-    console.error(`[opencode-acp] Parts:`, JSON.stringify(parts, null, 2));
+    
 
     try {
-      const [providerID, modelID] = params.model?.split("/") || [
-        "anthropic",
-        "claude-3-5-sonnet-20241022",
-      ];
+      const model = session.currentModel || "default";
+      const [providerID, modelID] = model.split("/");
+      
 
       const { data: result, error } = await this.opencodeClient.session.prompt({
         path: { id: session.opencodeSessionId },
@@ -253,28 +224,44 @@ export class OpencodeAcpAgent {
         throw new Error("No result from prompt");
       }
 
-      console.error(`[opencode-acp] Got response from opencode`);
+      
 
       for (const part of result.parts) {
         if (part.type === "text") {
+          const textPart = part as TextPart;
           await this.client.sessionUpdate({
             sessionId: params.sessionId,
             update: {
               sessionUpdate: "agent_message_chunk",
               content: {
                 type: "text",
-                text: part.text,
+                text: textPart.text,
               },
             },
           });
-        } else if (part.type === "thinking") {
+        } else if (part.type === "tool") {
+          const toolPart = part as ToolPart;
+          if (toolPart.state.status === "completed") {
+            await this.client.sessionUpdate({
+              sessionId: params.sessionId,
+              update: {
+                sessionUpdate: "agent_thought_chunk",
+                content: {
+                  type: "text",
+                  text: toolPart.state.output,
+                },
+              },
+            });
+          }
+        } else if (part.type === "reasoning") {
+          const reasoningPart = part as ReasoningPart;
           await this.client.sessionUpdate({
             sessionId: params.sessionId,
             update: {
               sessionUpdate: "agent_thought_chunk",
               content: {
                 type: "text",
-                text: part.text,
+                text: reasoningPart.text,
               },
             },
           });
@@ -301,9 +288,7 @@ export class OpencodeAcpAgent {
         await this.opencodeClient.session.abort({
           path: { id: session.opencodeSessionId },
         });
-        console.error(
-          `[opencode-acp] Aborted session ${session.opencodeSessionId}`
-        );
+        
       } catch (error) {
         console.error("[opencode-acp] Failed to abort session:", error);
       }
@@ -316,6 +301,10 @@ export class OpencodeAcpAgent {
     if (!this.sessions[params.sessionId]) {
       throw new Error("Session not found");
     }
+
+    const session = this.sessions[params.sessionId];
+    
+    session.currentModel = params.modelId;
   }
 }
 
