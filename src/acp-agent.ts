@@ -182,25 +182,7 @@ export class OpencodeAcpAgent {
         },
       ];
 
-      const availableModes = [
-        {
-          id: "default",
-          name: "Always Ask",
-          description: "Prompts for permission on first use of each tool",
-        },
-        {
-          id: "acceptEdits",
-          name: "Accept Edits",
-          description:
-            "Automatically accepts file edit permissions for the session",
-        },
-        {
-          id: "plan",
-          name: "Plan Mode",
-          description:
-            "opencode can analyze but not modify files or execute commands",
-        },
-      ];
+      const availableModes = await this.getAvailableModes();
 
       // Send available commands and modes after a short delay
       setTimeout(() => {
@@ -765,6 +747,80 @@ export class OpencodeAcpAgent {
     session.currentModel = params.modelId;
   }
 
+  private async getAvailableModes(): Promise<any[]> {
+    if (!this.opencodeClient) {
+      // Fallback to hardcoded modes if client not available
+      return [
+        {
+          id: "default",
+          name: "Always Ask",
+          description: "Prompts for permission on first use of each tool",
+        },
+        {
+          id: "acceptEdits",
+          name: "Accept Edits",
+          description: "Automatically accepts file edit permissions for the session",
+        },
+        {
+          id: "plan",
+          name: "Plan Mode",
+          description: "opencode can analyze but not modify files or execute commands",
+        },
+      ];
+    }
+
+    try {
+      const { data: agentsData, error } = await this.opencodeClient.app.agents();
+      if (error || !agentsData) {
+        console.error("[opencode-acp] Error getting agents:", error);
+        // Fallback to hardcoded modes
+        return [
+          {
+            id: "default",
+            name: "Always Ask",
+            description: "Prompts for permission on first use of each tool",
+          },
+          {
+            id: "acceptEdits",
+            name: "Accept Edits",
+            description: "Automatically accepts file edit permissions for the session",
+          },
+          {
+            id: "plan",
+            name: "Plan Mode",
+            description: "opencode can analyze but not modify files or execute commands",
+          },
+        ];
+      }
+      // Transform agents to mode-like structure for ACP compatibility
+      return agentsData.map((agent: any) => ({
+        id: agent.name,
+        name: agent.name,
+        description: agent.description || `Agent: ${agent.name}`,
+      }));
+    } catch (error) {
+      console.error("[opencode-acp] Failed to fetch agents:", error);
+      // Fallback to hardcoded modes
+      return [
+        {
+          id: "default",
+          name: "Always Ask",
+          description: "Prompts for permission on first use of each tool",
+        },
+        {
+          id: "acceptEdits",
+          name: "Accept Edits",
+          description: "Automatically accepts file edit permissions for the session",
+        },
+        {
+          id: "plan",
+          name: "Plan Mode",
+          description: "opencode can analyze but not modify files or execute commands",
+        },
+      ];
+    }
+  }
+
   async setSessionMode(
     params: SetSessionModeRequest,
   ): Promise<SetSessionModeResponse | void> {
@@ -772,15 +828,12 @@ export class OpencodeAcpAgent {
       throw new Error("Session not found");
     }
 
-    // Validate modeId against available modes
-    const availableModes = [
-      "default",
-      "acceptEdits", 
-      "plan"
-    ];
+    // Get available modes from opencode
+    const availableModes = await this.getAvailableModes();
+    const availableModeIds = availableModes.map((mode) => mode.id);
     
-    if (!availableModes.includes(params.modeId)) {
-      throw new Error(`Invalid mode: ${params.modeId}. Available modes: ${availableModes.join(", ")}`);
+    if (!availableModeIds.includes(params.modeId)) {
+      throw new Error(`Invalid mode: ${params.modeId}. Available modes: ${availableModeIds.join(", ")}`);
     }
 
     // Store the current mode in session
@@ -894,25 +947,7 @@ export class OpencodeAcpAgent {
         }
       }
 
-      const availableModes = [
-        {
-          id: "default",
-          name: "Always Ask",
-          description: "Prompts for permission on first use of each tool",
-        },
-        {
-          id: "acceptEdits",
-          name: "Accept Edits",
-          description:
-            "Automatically accepts file edit permissions for the session",
-        },
-        {
-          id: "plan",
-          name: "Plan Mode",
-          description:
-            "opencode can analyze but not modify files or execute commands",
-        },
-      ];
+      const availableModes = await this.getAvailableModes();
 
       return {
         models: {
